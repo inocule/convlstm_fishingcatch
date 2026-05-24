@@ -7,18 +7,24 @@ Aligned to:
   02_preprocessing.ipynb  – 7 channels (sst,ssh,vo,uo,chl,nppv,fishing_effort)
                             LAT 10-20°N · LON 114-120°E · 0.25° grid 41×25
   03_model_training.ipynb – input_shape (3,41,25,7), 70/15/15 split
+                            saves: convlstm_model.keras, best_model.keras,
+                                   X_test.npy, y_test.npy,
+                                   training_history.json, data_summary.json
   04_evaluation.ipynb     – RMSE,MAE,F1,SSI,Wasserstein; values stored as strings
+                            saves: predictions.npy, evaluation_results.csv
   05_visualization.ipynb  – extent LAT 7-20, fishing cmap, Reds for MAE/RMSE
+                            saves: obs_vs_pred.png, error_maps.png,
+                                   rmse_over_time.png, training_history.png
 
 Run in Colab
 ────────────
-  !pip install streamlit -q
-  !npm install -g localtunnel
-  # upload or %%writefile this file, then:
-  !streamlit run Full_ConvLSTM.py &>/content/logs.txt &
-  !lt --port 8501
-  # paste the IP printed below as the tunnel password
-  import urllib; print(urllib.request.urlopen('https://ipv4.icanhazip.com').read().decode().strip())
+!pip install streamlit -q
+!npm install -g localtunnel
+# upload or %%writefile this file, then:
+!streamlit run Full_ConvLSTM.py --server.enableCORS=false --server.enableXsrfProtection=false &>/content/logs.txt &
+!lt --port 8501
+# paste the IP printed below as the tunnel password
+import urllib; print(urllib.request.urlopen('https://ipv4.icanhazip.com').read().decode().strip())
 """
 
 import os, json, warnings
@@ -105,14 +111,9 @@ CMAP_FISHING = LinearSegmentedColormap.from_list(
     "fishing", ["#000033","#0000FF","#FF00FF","#FF0000"]
 )
 
-# Test month labels: 2019-01 to 2024-12 = 72 months → 68 sequences (seq=3,pred=1)
-# 70% train ≈ 47, 15% val ≈ 10, 15% test ≈ 11  (confirmed by 04_eval output)
-_all_months = pd.period_range(DATE_START, DATE_END, freq="M")
-_seq_months = _all_months[SEQ_LEN:]          # sequences start at index 3
-_n_seq      = len(_seq_months)
-_train_n    = int(0.70 * _n_seq)
-_val_n      = int(0.15 * _n_seq)
-TEST_LABELS = [str(p) for p in _seq_months[_train_n + _val_n:]]
+# Global test labels (will be resolved dynamically once data is loaded)
+TEST_LABELS = [str(p) for p in pd.period_range("2023-11-01", "2024-12-31", freq="M")]
+
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -169,10 +170,10 @@ def add_cb(fig, im, ax, label=""):
 @st.cache_data(show_spinner=False)
 def load_outputs(data_dir):
     out = {}
-    for name in ["predictions.npy","y_test.npy","X_test.npy"]:
+    for name in ["predictions.npy", "y_test.npy", "X_test.npy"]:
         p = os.path.join(data_dir, name)
         if os.path.exists(p):
-            out[name.replace(".npy","")] = np.load(p)
+            out[name.replace(".npy", "")] = np.load(p)
 
     p = os.path.join(data_dir, "evaluation_results.csv")
     if os.path.exists(p):
@@ -180,10 +181,15 @@ def load_outputs(data_dir):
 
     p = os.path.join(data_dir, "training_history.json")
     if os.path.exists(p):
-        with open(p) as f:
-            out["history"] = json.load(f)
+        with open(p) as fh:
+            out["history"] = json.load(fh)
 
-    for fname in ["preprocessed_features.nc","ais_fishing_effort_gridded.nc"]:
+    p = os.path.join(data_dir, "data_summary.json")
+    if os.path.exists(p):
+        with open(p) as fh:
+            out["data_summary"] = json.load(fh)
+
+    for fname in ["preprocessed_features.nc", "ais_fishing_effort_gridded.nc"]:
         p = os.path.join(data_dir, fname)
         if os.path.exists(p):
             out[fname] = p
@@ -192,9 +198,11 @@ def load_outputs(data_dir):
 
 @st.cache_resource(show_spinner=False)
 def load_model(data_dir):
+    """Try .keras first (Notebook 03 native format), then .h5 legacy fallback."""
     try:
         import tensorflow as tf
-        for name in ["convlstm_model.h5","best_model.h5","convlstm_model.keras"]:
+        for name in ["convlstm_model.keras", "best_model.keras",
+                     "convlstm_model.h5",    "best_model.h5"]:
             p = os.path.join(data_dir, name)
             if os.path.exists(p):
                 return tf.keras.models.load_model(p), name
@@ -248,19 +256,95 @@ def monthly_rmse_list(y2d, p2d):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# SIDEBAR
+# SIDEBAR - PART 1 (Drive Path input)
 # ─────────────────────────────────────────────────────────────────────────────
 with st.sidebar:
     st.markdown("### 🌊 WPS FishAI")
-    st.caption("West Philippine Sea · 2019–2024")
-    st.divider()
-
+    
     data_dir = st.text_input(
         "Drive path",
         value="/content/drive/MyDrive/fishing_project/",
         help="Google Drive folder with .npy / .json / .csv outputs",
     )
 
+# ─────────────────────────────────────────────────────────────────────────────
+# LOAD DATA & DYNAMIC DATES RESOLUTION
+# ─────────────────────────────────────────────────────────────────────────────
+with st.spinner("Loading pipeline outputs…"):
+    data = load_outputs(data_dir)
+
+preds_raw  = data.get("predictions")
+y_test_raw = data.get("y_test")
+X_test     = data.get("X_test")
+eval_df    = data.get("eval_df")
+history    = data.get("history")
+
+preds  = squeeze2d(preds_raw)
+y_test = squeeze2d(y_test_raw)
+
+has_preds   = preds is not None and y_test is not None
+has_history = history is not None
+n_test      = len(preds) if has_preds else 0
+
+# Dynamic Date Resolution
+fallback_start = "2019-01-01"
+fallback_end   = "2024-12-31"
+
+# 1. Try to load date range from data_summary.json
+summary_path = os.path.join(data_dir, "data_summary.json")
+if os.path.exists(summary_path):
+    try:
+        with open(summary_path) as f:
+            summary = json.load(f)
+            if "date_range" in summary:
+                parts = summary["date_range"].split(" to ")
+                if len(parts) == 2:
+                    fallback_start = parts[0]
+                    fallback_end = parts[1]
+    except Exception:
+        pass
+
+# 2. Try to get exact times from preprocessed NetCDF if available
+all_months = []
+feat_path = data.get("preprocessed_features.nc")
+if feat_path and os.path.exists(feat_path):
+    try:
+        import xarray as xr
+        with xr.open_dataset(feat_path) as ds:
+            all_months = [str(pd.Timestamp(t).to_period("M")) for t in ds.time.values]
+            fallback_start = str(pd.Timestamp(ds.time.values[0]).strftime("%Y-%m-%d"))
+            fallback_end = str(pd.Timestamp(ds.time.values[-1]).strftime("%Y-%m-%d"))
+    except Exception:
+        pass
+
+# Generate monthly periods between fallback start/end if NetCDF wasn't read
+if not all_months:
+    try:
+        periods = pd.period_range(fallback_start, fallback_end, freq="M")
+        all_months = [str(p) for p in periods]
+    except Exception:
+        all_months = [f"Month {i+1}" for i in range(72)]
+
+date_start_dt = pd.to_datetime(fallback_start)
+date_end_dt   = pd.to_datetime(fallback_end)
+start_year    = date_start_dt.year
+end_year      = date_end_dt.year
+total_months  = len(all_months)
+
+seq_months = all_months[SEQ_LEN:]
+if n_test > 0:
+    TEST_LABELS = seq_months[-n_test:]
+else:
+    _n_seq = len(seq_months)
+    _train_n = int(0.70 * _n_seq)
+    _val_n = int(0.15 * _n_seq)
+    TEST_LABELS = [str(p) for p in seq_months[_train_n + _val_n:]]
+
+# ─────────────────────────────────────────────────────────────────────────────
+# SIDEBAR - PART 2 (Dependent on resolved dates)
+# ─────────────────────────────────────────────────────────────────────────────
+with st.sidebar:
+    st.caption(f"West Philippine Sea · {start_year}–{end_year}")
     st.divider()
     st.markdown("#### Visualization")
     threshold    = st.slider("Prediction threshold", 0.0, 1.0, 0.5, 0.05)
@@ -286,37 +370,18 @@ with st.sidebar:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# LOAD DATA
-# ─────────────────────────────────────────────────────────────────────────────
-with st.spinner("Loading pipeline outputs…"):
-    data = load_outputs(data_dir)
-
-preds_raw  = data.get("predictions")
-y_test_raw = data.get("y_test")
-X_test     = data.get("X_test")
-eval_df    = data.get("eval_df")
-history    = data.get("history")
-
-preds  = squeeze2d(preds_raw)
-y_test = squeeze2d(y_test_raw)
-
-has_preds   = preds is not None and y_test is not None
-has_history = history is not None
-n_test      = len(preds) if has_preds else 0
-
-
-# ─────────────────────────────────────────────────────────────────────────────
 # HEADER
 # ─────────────────────────────────────────────────────────────────────────────
 st.markdown("## West Philippine Sea Fishing Ground Prediction System")
 st.caption(
     "ConvLSTM2D · CMEMS (physics 0.083° + BGC 0.25°) + AIS (GFW v3.0) · "
-    "7 channels · 41×25 grid · 0.25° · 2019–2024"
+    f"7 channels · {N_LAT}×{N_LON} grid · 0.25° · {start_year}–{end_year}"
 )
 st.divider()
 
-tab_dash, tab_pred, tab_anal, tab_about = st.tabs([
-    "Dashboard", "Predictions", "Analytics", "About"
+
+tab_dash, tab_pred, tab_anal, tab_pipeline, tab_about = st.tabs([
+    "Dashboard", "Predictions", "Analytics", "Pipeline", "About"
 ])
 
 
@@ -466,11 +531,11 @@ with tab_pred:
             "Run `04_evaluation.ipynb` (which calls `model.predict()` and saves "
             "`predictions.npy`, `y_test.npy`) then check the Drive path in the sidebar."
         )
-        st.stop()
 
-    # ── controls ──
-    ctrl1, ctrl2, ctrl3 = st.columns([2, 1, 1])
-    with ctrl1:
+    if has_preds:
+      # ── controls ──
+      ctrl1, ctrl2, ctrl3 = st.columns([2, 1, 1])
+      with ctrl1:
         month_i = st.slider(
             "Test sample index", 0, n_test - 1, n_test - 1,
             format=f"sample %d  ({'{}'})".format(
@@ -479,119 +544,118 @@ with tab_pred:
             ),
             key="_mi",
         )
-    with ctrl2:
+      with ctrl2:
         vmax_pred = st.slider("Color scale max", 0.1, 1.0, 1.0, 0.05,
                               key="vmax_pred")
-    with ctrl3:
+      with ctrl3:
         show_diff = st.toggle("Difference map", value=False)
 
-    lbl = tlabel(month_i)
-    st.markdown(f"#### {lbl}  —  sample {month_i + 1} of {n_test}")
+      lbl = tlabel(month_i)
+      st.markdown(f"#### {lbl}  —  sample {month_i + 1} of {n_test}")
 
-    obs_map  = y_test[month_i]
-    pred_map = preds[month_i]
+      obs_map  = y_test[month_i]
+      pred_map = preds[month_i]
 
-    # ── maps (05_visualization cell[5] layout) ──
-    if show_diff:
-        fig, axes = sfig(13, 4.5, ncols=3)
-        panels = [
-            (obs_map,              CMAP_FISHING, 0,     vmax_pred, "Observed AIS effort"),
-            (pred_map,             CMAP_FISHING, 0,     vmax_pred, "Predicted probability"),
-            (pred_map - obs_map,   "RdBu_r",    -0.3,   0.3,      "Difference (pred − obs)"),
-        ]
-    else:
-        fig, axes = sfig(10, 4.5, ncols=2)
-        panels = [
-            (obs_map,  CMAP_FISHING, 0, vmax_pred, "Observed AIS effort"),
-            (pred_map, CMAP_FISHING, 0, vmax_pred, "Predicted probability"),
-        ]
+      # ── maps (05_visualization layout) ──
+      if show_diff:
+          fig, axes = sfig(13, 4.5, ncols=3)
+          panels = [
+              (obs_map,              CMAP_FISHING, 0,     vmax_pred, "Observed AIS effort"),
+              (pred_map,             CMAP_FISHING, 0,     vmax_pred, "Predicted probability"),
+              (pred_map - obs_map,   "RdBu_r",    -0.3,   0.3,      "Difference (pred − obs)"),
+          ]
+      else:
+          fig, axes = sfig(10, 4.5, ncols=2)
+          panels = [
+              (obs_map,  CMAP_FISHING, 0, vmax_pred, "Observed AIS effort"),
+              (pred_map, CMAP_FISHING, 0, vmax_pred, "Predicted probability"),
+          ]
 
-    for ax, (arr, cmap, vmin, vmax_c, title) in zip(np.array(axes).ravel(), panels):
-        im = ax.imshow(
-            arr,
-            extent=[LON_MIN, LON_MAX, LAT_MIN_VIZ, LAT_MAX_VIZ],
-            cmap=cmap, vmin=vmin, vmax=vmax_c,
-            aspect="auto", origin="lower",
-        )
-        if show_contour and cmap is CMAP_FISHING:
-            ax.contour(arr, levels=[threshold], colors=["#64748b"],
-                       linewidths=0.6,
-                       extent=[LON_MIN, LON_MAX, LAT_MIN_VIZ, LAT_MAX_VIZ])
-        if show_grid:
-            ax.grid(True, linewidth=0.3)
-        ax.set_xlabel("Longitude (°E)")
-        ax.set_ylabel("Latitude (°N)")
-        ax.set_title(f"{title} · {lbl}")
-        add_cb(fig, im, ax)
+      for ax, (arr, cmap, vmin, vmax_c, title) in zip(np.array(axes).ravel(), panels):
+          im = ax.imshow(
+              arr,
+              extent=[LON_MIN, LON_MAX, LAT_MIN_VIZ, LAT_MAX_VIZ],
+              cmap=cmap, vmin=vmin, vmax=vmax_c,
+              aspect="auto", origin="lower",
+          )
+          if show_contour and cmap is CMAP_FISHING:
+              ax.contour(arr, levels=[threshold], colors=["#64748b"],
+                         linewidths=0.6,
+                         extent=[LON_MIN, LON_MAX, LAT_MIN_VIZ, LAT_MAX_VIZ])
+          if show_grid:
+              ax.grid(True, linewidth=0.3)
+          ax.set_xlabel("Longitude (°E)")
+          ax.set_ylabel("Latitude (°N)")
+          ax.set_title(f"{title} · {lbl}")
+          add_cb(fig, im, ax)
 
-    plt.tight_layout()
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
+      plt.tight_layout()
+      st.pyplot(fig, use_container_width=True)
+      plt.close(fig)
 
-    # ── shared horizontal colorbar note ──
-    st.caption(
-        "Colormap: `fishing` — #000033 → #0000FF → #FF00FF → #FF0000  "
-        "(matches 05_visualization.ipynb)"
-    )
+      st.caption(
+          "Colormap: `fishing` — #000033 → #0000FF → #FF00FF → #FF0000  "
+          "(matches 05_visualization.ipynb)"
+      )
 
-    # ── cell statistics ──
-    st.divider()
-    st.markdown("#### Cell statistics — " + lbl)
-    s1, s2, s3, s4 = st.columns(4)
-    s1.metric("Peak predicted",       f"{float(np.nanmax(pred_map)):.4f}")
-    s2.metric(f"High cells (≥{threshold})", str(int((pred_map > threshold).sum())))
-    s3.metric("Mean predicted",       f"{float(np.nanmean(pred_map)):.4f}")
-    s4.metric("Mean observed",        f"{float(np.nanmean(obs_map)):.4f}")
+      # ── cell statistics ──
+      st.divider()
+      st.markdown("#### Cell statistics — " + lbl)
+      s1, s2, s3, s4 = st.columns(4)
+      s1.metric("Peak predicted",       f"{float(np.nanmax(pred_map)):.4f}")
+      s2.metric(f"High cells (≥{threshold})", str(int((pred_map > threshold).sum())))
+      s3.metric("Mean predicted",       f"{float(np.nanmean(pred_map)):.4f}")
+      s4.metric("Mean observed",        f"{float(np.nanmean(obs_map)):.4f}")
 
-    # ── spatial profiles ──
-    st.divider()
-    st.markdown("#### Spatial profiles")
-    st.caption("Latitudinal and longitudinal mean of observed vs. predicted.")
+      # ── spatial profiles ──
+      st.divider()
+      st.markdown("#### Spatial profiles")
+      st.caption("Latitudinal and longitudinal mean of observed vs. predicted.")
 
-    fig, (ax1, ax2) = sfig(11, 2.8, ncols=2)
-    lat_vals = np.linspace(LAT_MIN_DATA, LAT_MAX_DATA, pred_map.shape[0])
-    lon_vals = np.linspace(LON_MIN,      LON_MAX,      pred_map.shape[1])
+      fig, (ax1, ax2) = sfig(11, 2.8, ncols=2)
+      lat_vals = np.linspace(LAT_MIN_DATA, LAT_MAX_DATA, pred_map.shape[0])
+      lon_vals = np.linspace(LON_MIN,      LON_MAX,      pred_map.shape[1])
 
-    for ax, xvals, obs_agg, pred_agg, xlabel in [
-        (ax1, lat_vals,
-         np.nanmean(obs_map, axis=1), np.nanmean(pred_map, axis=1),
-         "Latitude (°N)"),
-        (ax2, lon_vals,
-         np.nanmean(obs_map, axis=0), np.nanmean(pred_map, axis=0),
-         "Longitude (°E)"),
-    ]:
-        ax.plot(xvals, obs_agg,  color="#475569", linewidth=1.2, label="Observed")
-        ax.plot(xvals, pred_agg, color="#64748b", linewidth=1.2,
-                linestyle="--", label="Predicted")
-        ax.set_xlabel(xlabel)
-        ax.set_ylabel("Mean probability")
-        ax.grid(True, linewidth=0.3)
-        ax.legend()
+      for ax, xvals, obs_agg, pred_agg, xlabel in [
+          (ax1, lat_vals,
+           np.nanmean(obs_map, axis=1), np.nanmean(pred_map, axis=1),
+           "Latitude (°N)"),
+          (ax2, lon_vals,
+           np.nanmean(obs_map, axis=0), np.nanmean(pred_map, axis=0),
+           "Longitude (°E)"),
+      ]:
+          ax.plot(xvals, obs_agg,  color="#475569", linewidth=1.2, label="Observed")
+          ax.plot(xvals, pred_agg, color="#64748b", linewidth=1.2,
+                  linestyle="--", label="Predicted")
+          ax.set_xlabel(xlabel)
+          ax.set_ylabel("Mean probability")
+          ax.grid(True, linewidth=0.3)
+          ax.legend()
 
-    ax1.set_title("Latitudinal mean")
-    ax2.set_title("Longitudinal mean")
-    plt.tight_layout()
-    st.pyplot(fig, use_container_width=True)
-    plt.close(fig)
+      ax1.set_title("Latitudinal mean")
+      ax2.set_title("Longitudinal mean")
+      plt.tight_layout()
+      st.pyplot(fig, use_container_width=True)
+      plt.close(fig)
 
-    # ── download ──
-    st.divider()
-    dl1, dl2 = st.columns(2)
-    with dl1:
-        st.download_button(
-            "Download prediction array (.npy)",
-            data=pred_map.astype(np.float32).tobytes(),
-            file_name=f"pred_{lbl.replace(' ','_')}.npy",
-            mime="application/octet-stream",
-        )
-    with dl2:
-        if eval_df is not None:
-            st.download_button(
-                "Download evaluation results (.csv)",
-                data=eval_df.to_csv(index=False).encode(),
-                file_name="evaluation_results.csv",
-                mime="text/csv",
-            )
+      # ── download ──
+      st.divider()
+      dl1, dl2 = st.columns(2)
+      with dl1:
+          st.download_button(
+              "Download prediction array (.npy)",
+              data=pred_map.astype(np.float32).tobytes(),
+              file_name=f"pred_{lbl.replace(' ','_')}.npy",
+              mime="application/octet-stream",
+          )
+      with dl2:
+          if eval_df is not None:
+              st.download_button(
+                  "Download evaluation results (.csv)",
+                  data=eval_df.to_csv(index=False).encode(),
+                  file_name="evaluation_results.csv",
+                  mime="text/csv",
+              )
 
 
 # ═════════════════════════════════════════════════════════════════════════════
@@ -800,7 +864,7 @@ with tab_anal:
                     key="varexp_var",
                 )
             with vc2:
-                time_i = st.slider("Month index (0 = 2019-01)",
+                time_i = st.slider(f"Month index (0 = {all_months[0]})",
                                    0, n_times - 1, 0, key="varexp_t")
 
             arr_var = feats[sel_var].isel(time=time_i).values
@@ -835,7 +899,106 @@ with tab_anal:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# TAB 4 — ABOUT
+# TAB 4 — PIPELINE STATUS
+# ═════════════════════════════════════════════════════════════════════════════
+with tab_pipeline:
+    st.markdown("### Pipeline Status")
+    st.caption("Step-by-step checklist of all notebook output files. Green = present in Drive path.")
+
+    # ── data_summary.json contents ──
+    data_summary = data.get("data_summary")
+    if data_summary:
+        st.markdown("#### Dataset metadata (`data_summary.json`)")
+        ds_col1, ds_col2, ds_col3, ds_col4 = st.columns(4)
+        ds_col1.metric("Months",    str(data_summary.get("n_months", "--")))
+        ds_col2.metric("Grid",
+                       f"{data_summary.get('n_lat','?')}×{data_summary.get('n_lon','?')}")
+        ds_col3.metric("Channels",  str(data_summary.get("n_channels", "--")))
+        ds_col4.metric("Seq length",str(data_summary.get("seq_len", "--")))
+        ds_col5, ds_col6, ds_col7, ds_col8 = st.columns(4)
+        ds_col5.metric("Train sequences", str(data_summary.get("n_train", "--")))
+        ds_col6.metric("Val sequences",   str(data_summary.get("n_val",   "--")))
+        ds_col7.metric("Test sequences",  str(data_summary.get("n_test",  "--")))
+        ds_col8.metric("Best epoch",      str(data_summary.get("best_epoch", "--")))
+        st.divider()
+    else:
+        st.info("No `data_summary.json` found. Run `03_model_training.ipynb` to generate it.")
+        st.divider()
+
+    # ── per-phase output checklist ──
+    phases = [
+        ("Phase 1 — Data Loading (`01_data_loading.ipynb`)", [
+            ("physics_raw_region.nc",   "CMEMS physics regional cache (0.083° NetCDF)"),
+            ("bgc_raw_region.nc",       "CMEMS BGC regional cache (0.25° NetCDF)"),
+            ("ais_raw_region.parquet",  "AIS fishing effort regional cache (Parquet)"),
+        ]),
+        ("Phase 2 — Preprocessing (`02_preprocessing.ipynb`)", [
+            ("preprocessed_features.nc",      "7-channel normalised feature cube"),
+            ("ais_fishing_effort_gridded.nc",  "AIS aggregated to 0.25° model grid"),
+        ]),
+        ("Phase 3 — Model Training (`03_model_training.ipynb`)", [
+            ("convlstm_model.keras",  "Final trained ConvLSTM2D model (native Keras)"),
+            ("best_model.keras",      "Best val_loss checkpoint (native Keras)"),
+            ("X_test.npy",            "Test input sequences (N, 3, 41, 25, 7)"),
+            ("y_test.npy",            "Test target maps (N, 41, 25, 1)"),
+            ("training_history.json", "Loss & MAE per epoch"),
+            ("data_summary.json",     "Dataset metadata for dashboard"),
+        ]),
+        ("Phase 4 — Evaluation (`04_evaluation.ipynb`)", [
+            ("predictions.npy",        "Model predictions on test set (N, 41, 25, 1)"),
+            ("evaluation_results.csv", "RMSE, MAE, F1, SSI, Wasserstein metrics"),
+        ]),
+        ("Phase 5 — Visualization (`05_visualization.ipynb`)", [
+            ("obs_vs_pred.png",     "Observed vs. predicted heatmap grid"),
+            ("error_maps.png",      "Spatial mean error / MAE / RMSE maps"),
+            ("rmse_over_time.png",  "Per-sample RMSE bar chart"),
+            ("training_history.png","Training loss & MAE curves"),
+        ]),
+    ]
+
+    for phase_title, file_list in phases:
+        st.markdown(f"#### {phase_title}")
+        rows = []
+        for fname, desc in file_list:
+            fpath  = os.path.join(data_dir, fname)
+            exists = os.path.exists(fpath)
+            size_str = ""
+            if exists:
+                try:
+                    size_kb = os.path.getsize(fpath) / 1024
+                    size_str = (f"{size_kb/1024:.1f} MB" if size_kb > 1024
+                                else f"{size_kb:.0f} KB")
+                except Exception:
+                    pass
+            rows.append({
+                "": "✅" if exists else "⬜",
+                "File": fname,
+                "Description": desc,
+                "Size": size_str,
+            })
+        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+
+    st.divider()
+    # ── overall readiness ──
+    all_critical = [
+        "preprocessed_features.nc",
+        "convlstm_model.keras",
+        "X_test.npy", "y_test.npy",
+        "predictions.npy", "evaluation_results.csv",
+    ]
+    missing = [fn for fn in all_critical
+               if not os.path.exists(os.path.join(data_dir, fn))]
+    if not missing:
+        st.success("All critical pipeline files present — dashboard is fully operational.")
+    else:
+        st.warning(
+            f"Missing {len(missing)} critical file(s): {', '.join(missing)}  \n"
+            "Run the corresponding notebook(s) to generate them."
+        )
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 5 — ABOUT
 # ═════════════════════════════════════════════════════════════════════════════
 with tab_about:
     st.markdown("### About this system")
@@ -845,7 +1008,7 @@ with tab_about:
     steps = [
         ("01 Data loading",
          "Mount Drive · load CMEMS physics (0.083°) and BGC (0.25°) NetCDF · "
-         "load AIS CSVs (flat folder, bbox-filtered) · 72 months 2019-2024"),
+         f"load AIS CSVs (flat folder, bbox-filtered) · {total_months} months {start_year}-{end_year}"),
         ("02 Preprocessing",
          "Select depth 0.49 m (physics) · depth-average 0–5 m (BGC) · "
          "resample monthly · regrid physics → 0.25° · linear gap fill · "
@@ -892,17 +1055,18 @@ epochs=50  batch_size=8  patience=10""", language="text")
 
     with o_col:
         st.markdown("#### Output file status")
+        st.caption("See the **Pipeline** tab for a detailed per-phase checklist with file sizes.")
         outputs = {
-            "data_summary.json":           "Phase 1 — dataset shapes",
-            "preprocessed_features.nc":    "Phase 2 — 7-channel normalised cube",
-            "ais_fishing_effort_gridded.nc":"Phase 2 — AIS on 0.25° grid",
-            "best_model.h5":               "Phase 3 — best val checkpoint",
-            "convlstm_model.h5":           "Phase 3 — final model",
-            "training_history.json":       "Phase 3 — loss & MAE per epoch",
-            "X_test.npy":                  "Phase 3 — test inputs (N,3,41,25,7)",
-            "y_test.npy":                  "Phase 3 — test labels (N,41,25,1)",
-            "predictions.npy":             "Phase 4 — model predictions (N,41,25,1)",
-            "evaluation_results.csv":      "Phase 4 — RMSE,MAE,F1,SSI,Wasserstein",
+            "data_summary.json":            "Phase 3 — dataset metadata",
+            "preprocessed_features.nc":     "Phase 2 — 7-channel normalised cube",
+            "ais_fishing_effort_gridded.nc": "Phase 2 — AIS on 0.25° grid",
+            "best_model.keras":             "Phase 3 — best val checkpoint (native Keras)",
+            "convlstm_model.keras":         "Phase 3 — final model (native Keras)",
+            "training_history.json":        "Phase 3 — loss & MAE per epoch",
+            "X_test.npy":                   "Phase 3 — test inputs (N,3,41,25,7)",
+            "y_test.npy":                   "Phase 3 — test labels (N,41,25,1)",
+            "predictions.npy":              "Phase 4 — model predictions (N,41,25,1)",
+            "evaluation_results.csv":       "Phase 4 — RMSE,MAE,F1,SSI,Wasserstein",
         }
         rows = []
         for fname, desc in outputs.items():
@@ -921,25 +1085,25 @@ epochs=50  batch_size=8  patience=10""", language="text")
             "**CMEMS Physics** `GLOBAL_MULTIYEAR_PHY_001_030`  \n"
             "thetao (SST) · uo · vo · zos (SSH)  \n"
             "0.083° monthly · depth sel. 0.49 m  \n"
-            "2015–2024 (sliced to 2019–2024)"
+            f"2015–{end_year} (sliced to {start_year}–{end_year})"
         )
     with d2:
         st.info(
             "**CMEMS BGC** `GLOBAL_MULTIYEAR_BGC_001_029`  \n"
             "chl · nppv  \n"
             "0.25° monthly · depth avg 0–5 m  \n"
-            "2015–2024 (sliced to 2019–2024)"
+            f"2015–{end_year} (sliced to {start_year}–{end_year})"
         )
     with d3:
         st.info(
             "**AIS** Global Fishing Watch v3.0  \n"
             "fleet-monthly-csvs-10-v3-YYYY-MM-DD.csv  \n"
             "flat folder · bbox-filtered · log1p-normalised  \n"
-            "72 months · 2019-01 to 2024-12"
+            f"{total_months} months · {fallback_start[:7]} to {fallback_end[:7]}"
         )
 
     st.divider()
     st.caption(
         "West Philippine Sea Fishing Ground Prediction System · "
-        "ConvLSTM2D · CMEMS + AIS GFW v3.0 · 2019–2024 · Built with Streamlit"
+        f"ConvLSTM2D · CMEMS + AIS GFW v3.0 · {start_year}–{end_year} · Built with Streamlit"
     )
