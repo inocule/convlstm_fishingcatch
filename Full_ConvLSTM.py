@@ -261,10 +261,13 @@ def monthly_rmse_list(y2d, p2d):
 with st.sidebar:
     st.markdown("### 🌊 WPS FishAI")
     
+    # Default to the folder containing this script so local runs work out-of-the-box.
+    # In Colab you can still paste your Drive path manually.
+    _default_dir = os.path.dirname(os.path.abspath(__file__))
     data_dir = st.text_input(
-        "Drive path",
-        value="/content/drive/MyDrive/fishing_project/",
-        help="Google Drive folder with .npy / .json / .csv outputs",
+        "Data path",
+        value=_default_dir,
+        help="Folder containing .npy / .json / .csv pipeline outputs",
     )
 
 # ─────────────────────────────────────────────────────────────────────────────
