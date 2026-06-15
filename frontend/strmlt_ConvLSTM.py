@@ -1,16 +1,15 @@
 """
-Full_ConvLSTM.py  –  West Philippine Sea Fishing Ground Prediction System
+strmlt_ConvLSTM.py  –  West Philippine Sea Fishing Ground Prediction System
 Streamlit dashboard for the ConvLSTM spatiotemporal deep learning pipeline.
 
 Aligned to:
   01_data_loading.ipynb   – AIS 2019-2024, flat CSV folder, 72 months
   02_preprocessing.ipynb  – 7 channels (sst,ssh,vo,uo,chl,nppv,fishing_effort)
                             LAT 10-20°N · LON 114-120°E · 0.25° grid 41×25
-  03_model_training.ipynb – input_shape (3,41,25,7), 70/15/15 split
-                            saves: convlstm_model.keras, best_model.keras,
-                                   X_test.npy, y_test.npy,
+  03_buildntrain.ipynb – input_shape (3,41,25,7), 70/15/15 split
+                            saves: convlstm_weights.npz, X_test.npy, y_test.npy,
                                    training_history.json, data_summary.json
-  04_evaluation.ipynb     – RMSE,MAE,F1,SSI,Wasserstein; values stored as strings
+  04_evaluation.ipynb     – RMSE,MAE,F1_best,F1_config,SSI,Wasserstein; values stored as strings
                             saves: predictions.npy, evaluation_results.csv
   05_visualization.ipynb  – extent LAT 7-20, fishing cmap, Reds for MAE/RMSE
                             saves: obs_vs_pred.png, error_maps.png,
@@ -73,6 +72,13 @@ hr{border-color:#1e293b!important}
 .stCaption{color:#475569!important;font-size:.72rem!important}
 [data-testid="stSelectbox"]>div>div{background:#1e293b!important;
   border:0.5px solid #334155!important;color:#94a3b8!important}
+/* Upload tab dropzone styling */
+[data-testid="stFileUploader"]{background:#0f172a!important;
+  border:1.5px dashed #334155!important;border-radius:10px!important;
+  padding:10px!important;transition:border-color .2s!important}
+[data-testid="stFileUploader"]:hover{border-color:#475569!important}
+[data-testid="stFileUploader"] label{color:#64748b!important;font-size:.82rem!important}
+[data-testid="stFileUploader"] small{color:#334155!important}
 </style>
 """, unsafe_allow_html=True)
 
@@ -198,17 +204,16 @@ def load_outputs(data_dir):
 
 @st.cache_resource(show_spinner=False)
 def load_model(data_dir):
-    """Try .keras first (Notebook 03 native format), then .h5 legacy fallback."""
-    try:
-        import tensorflow as tf
-        for name in ["convlstm_model.keras", "best_model.keras",
-                     "convlstm_model.h5",    "best_model.h5"]:
-            p = os.path.join(data_dir, name)
-            if os.path.exists(p):
-                return tf.keras.models.load_model(p), name
-    except Exception as e:
-        return None, str(e)
-    return None, "not found"
+    """Load NumPy weights (.npz) saved by 03_buildntrain_numpy.ipynb.
+    Returns (weights_dict, filename) or (None, error_message)."""
+    for name in ["convlstm_weights.npz"]:
+        p = os.path.join(data_dir, name)
+        if os.path.exists(p):
+            try:
+                return np.load(p), name
+            except Exception as e:
+                return None, str(e)
+    return None, "convlstm_weights.npz not found"
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -245,11 +250,9 @@ def ema(series, alpha=0.55):
     return out
 
 def monthly_rmse_list(y2d, p2d):
-    from sklearn.metrics import mean_squared_error as _mse
     return [
-        float(np.sqrt(_mse(
-            np.nan_to_num(y2d[i].flatten(), nan=0.0),
-            np.nan_to_num(p2d[i].flatten(), nan=0.0),
+        float(np.sqrt(np.mean(
+            (np.nan_to_num(y2d[i].flatten(), nan=0.0) - np.nan_to_num(p2d[i].flatten(), nan=0.0)) ** 2
         )))
         for i in range(len(y2d))
     ]
@@ -263,7 +266,7 @@ with st.sidebar:
     
     # Default to the folder containing this script so local runs work out-of-the-box.
     # In Colab you can still paste your Drive path manually.
-    _default_dir = os.path.dirname(os.path.abspath(__file__))
+    _default_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data_output")
     data_dir = st.text_input(
         "Data path",
         value=_default_dir,
@@ -350,7 +353,7 @@ with st.sidebar:
     st.caption(f"West Philippine Sea · {start_year}–{end_year}")
     st.divider()
     st.markdown("#### Visualization")
-    threshold    = st.slider("Prediction threshold", 0.0, 1.0, 0.5, 0.05)
+    threshold    = st.slider("Prediction threshold", 0.0, 1.0, 0.10, 0.05)
     show_contour = st.toggle("Threshold contour", value=True)
     show_grid    = st.toggle("Grid overlay",       value=True)
 
@@ -364,7 +367,7 @@ with st.sidebar:
         ("Grid",          "41 × 25"),
         ("Resolution",    "0.25°"),
         ("Input shape",   "(3,41,25,7)"),
-        ("Parameters",    "~272 K"),
+        ("Parameters",    "20,313"),
         ("Train/Val/Test","70/15/15"),
     ]
     for k, v in specs:
@@ -383,8 +386,8 @@ st.caption(
 st.divider()
 
 
-tab_dash, tab_pred, tab_anal, tab_pipeline, tab_about = st.tabs([
-    "Dashboard", "Predictions", "Analytics", "Pipeline", "About"
+tab_upload, tab_dash, tab_pred, tab_anal, tab_pipeline,  tab_about = st.tabs([
+    "Data Upload","Dashboard", "Predictions", "Analytics", "Pipeline",  "About"
 ])
 
 
@@ -396,16 +399,18 @@ with tab_dash:
     # ── metrics (values come from evaluation_results.csv, stored as strings) ──
     m_rmse = get_metric(eval_df, "RMSE")
     m_mae  = get_metric(eval_df, "MAE")
-    m_f1   = get_metric(eval_df, "F1")
+    m_f1_best = get_metric(eval_df, "F1_best")
+    m_f1_cfg  = get_metric(eval_df, "F1_config")
     m_ssi  = get_metric(eval_df, "SSI")
     m_wd   = get_metric(eval_df, "Wasserstein")
 
-    c1,c2,c3,c4,c5 = st.columns(5)
+    c1,c2,c3,c4,c5,c6 = st.columns(6)
     c1.metric("RMSE",        fmt(m_rmse, ".6f"))
     c2.metric("MAE",         fmt(m_mae,  ".6f"))
-    c3.metric("F1 score",    fmt(m_f1,   ".4f"))
-    c4.metric("SSI",         fmt(m_ssi,  ".4f"))
-    c5.metric("Wasserstein", fmt(m_wd,   ".4f"))
+    c3.metric("F1 (Best)",   fmt(m_f1_best, ".4f"))
+    c4.metric("F1 (Config)", fmt(m_f1_cfg,  ".4f"))
+    c5.metric("SSI",         fmt(m_ssi,  ".4f"))
+    c6.metric("Wasserstein", fmt(m_wd,   ".4f"))
 
     st.divider()
 
@@ -671,7 +676,7 @@ with tab_anal:
     st.markdown("#### Evaluation results")
     st.caption(
         "From `evaluation_results.csv` (04_evaluation.ipynb). "
-        "Metrics: RMSE, MAE computed globally; F1 at threshold 0.5; "
+        "Metrics: RMSE, MAE computed globally; F1_best (optimal threshold sweep) and F1_config; "
         "SSI and Wasserstein per-sample then averaged."
     )
     if eval_df is not None:
@@ -939,17 +944,16 @@ with tab_pipeline:
             ("preprocessed_features.nc",      "7-channel normalised feature cube"),
             ("ais_fishing_effort_gridded.nc",  "AIS aggregated to 0.25° model grid"),
         ]),
-        ("Phase 3 — Model Training (`03_model_training.ipynb`)", [
-            ("convlstm_model.keras",  "Final trained ConvLSTM2D model (native Keras)"),
-            ("best_model.keras",      "Best val_loss checkpoint (native Keras)"),
-            ("X_test.npy",            "Test input sequences (N, 3, 41, 25, 7)"),
+        ("Phase 3 — Model Training (`03_buildntrain_numpy.ipynb`)", [
+            ("convlstm_weights.npz",  "Trained NumPy ConvLSTM weights (best val_loss checkpoint)"),
+            ("X_test.npy",            "Test input sequences (N, 3, 41, 25, 7) channel-last"),
             ("y_test.npy",            "Test target maps (N, 41, 25, 1)"),
             ("training_history.json", "Loss & MAE per epoch"),
             ("data_summary.json",     "Dataset metadata for dashboard"),
         ]),
         ("Phase 4 — Evaluation (`04_evaluation.ipynb`)", [
             ("predictions.npy",        "Model predictions on test set (N, 41, 25, 1)"),
-            ("evaluation_results.csv", "RMSE, MAE, F1, SSI, Wasserstein metrics"),
+            ("evaluation_results.csv", "RMSE, MAE, F1_best, F1_config, SSI, Wasserstein metrics"),
         ]),
         ("Phase 5 — Visualization (`05_visualization.ipynb`)", [
             ("obs_vs_pred.png",     "Observed vs. predicted heatmap grid"),
@@ -985,7 +989,7 @@ with tab_pipeline:
     # ── overall readiness ──
     all_critical = [
         "preprocessed_features.nc",
-        "convlstm_model.keras",
+        "convlstm_weights.npz",
         "X_test.npy", "y_test.npy",
         "predictions.npy", "evaluation_results.csv",
     ]
@@ -1001,7 +1005,254 @@ with tab_pipeline:
 
 
 # ═════════════════════════════════════════════════════════════════════════════
-# TAB 5 — ABOUT
+# TAB 5 — DATA UPLOAD
+# ═════════════════════════════════════════════════════════════════════════════
+with tab_upload:
+    st.markdown("### Data Upload")
+    st.caption(
+        "Drag-and-drop your raw data files here. AIS CSVs will be saved to the "
+        "`ais_raw/` sub-folder; CMEMS NetCDF files to `cmems_raw/`. "
+        "You can upload an entire folder's worth of files at once using the multi-file selector."
+    )
+
+    # ── destination config ──
+    st.markdown("#### Destination folders")
+    up_col1, up_col2 = st.columns(2)
+    with up_col1:
+        ais_dest = st.text_input(
+            "AIS output folder",
+            value=os.path.join(data_dir, "ais_raw"),
+            key="ais_dest",
+            help="AIS CSV files will be saved here (created if absent)",
+        )
+    with up_col2:
+        cmems_dest = st.text_input(
+            "CMEMS output folder",
+            value=os.path.join(data_dir, "cmems_raw"),
+            key="cmems_dest",
+            help="CMEMS NetCDF files will be saved here (created if absent)",
+        )
+
+    st.divider()
+
+    # ══════════════════════════════════════════
+    # AIS CSV UPLOADER
+    # ══════════════════════════════════════════
+    st.markdown("#### AIS Fishing Effort CSVs")
+    st.caption(
+        "Select all CSV files from your AIS folder "
+        "(`fleet-monthly-csvs-10-v3-YYYY-MM-DD.csv`). "
+        "You can select multiple files at once (Ctrl/Cmd+A to select all in the picker)."
+    )
+
+    ais_files = st.file_uploader(
+        "Drop AIS CSV files here",
+        type=["csv"],
+        accept_multiple_files=True,
+        key="ais_uploader",
+        help="Select all monthly AIS CSV files — Ctrl+A selects all in the file dialog",
+        label_visibility="collapsed",
+    )
+
+    if ais_files:
+        # ── preview table ──
+        ais_rows = []
+        total_ais_bytes = 0
+        for f in ais_files:
+            sz = len(f.getvalue())
+            total_ais_bytes += sz
+            sz_str = f"{sz/1024:.1f} KB" if sz < 1024*1024 else f"{sz/1024/1024:.2f} MB"
+            # Light validation: check header for expected AIS columns
+            try:
+                sample = pd.read_csv(f, nrows=1)
+                f.seek(0)
+                has_lat = any(c.lower() in ("lat", "latitude", "cell_ll_lat") for c in sample.columns)
+                has_lon = any(c.lower() in ("lon", "longitude", "cell_ll_lon") for c in sample.columns)
+                valid = "✅" if (has_lat and has_lon) else "⚠️"
+            except Exception:
+                f.seek(0)
+                valid = "❓"
+            ais_rows.append({"File": f.name, "Size": sz_str, "Valid": valid})
+
+        total_ais_mb = total_ais_bytes / 1024 / 1024
+        st.success(
+            f"**{len(ais_files)} AIS file(s) staged** — "
+            f"Total: {total_ais_mb:.2f} MB"
+        )
+        with st.expander(f"Preview {len(ais_files)} staged AIS files", expanded=len(ais_files) <= 20):
+            st.dataframe(
+                pd.DataFrame(ais_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        if st.button("💾 Save AIS files to disk", key="save_ais", type="primary"):
+            os.makedirs(ais_dest, exist_ok=True)
+            prog = st.progress(0, text="Saving AIS files…")
+            saved, skipped, errors = [], [], []
+            for i, f in enumerate(ais_files):
+                out_path = os.path.join(ais_dest, f.name)
+                try:
+                    with open(out_path, "wb") as fh:
+                        fh.write(f.getvalue())
+                    saved.append(f.name)
+                except Exception as e:
+                    errors.append((f.name, str(e)))
+                prog.progress((i + 1) / len(ais_files),
+                              text=f"Saving {f.name} ({i+1}/{len(ais_files)})…")
+            prog.empty()
+            if saved:
+                st.success(
+                    f"✅ Saved **{len(saved)}** AIS file(s) to `{ais_dest}`"
+                )
+            if errors:
+                for fname_e, err in errors:
+                    st.error(f"❌ {fname_e}: {err}")
+    else:
+        st.info(
+            "No AIS files staged yet. Click above to open the file picker, "
+            "then navigate to your AIS folder and select all CSV files "
+            "(use **Ctrl+A** or **Cmd+A** to select all)."
+        )
+
+    st.divider()
+
+    # ══════════════════════════════════════════
+    # CMEMS NetCDF UPLOADER
+    # ══════════════════════════════════════════
+    st.markdown("#### CMEMS NetCDF Files")
+    st.caption(
+        "Upload your CMEMS physics and/or BGC NetCDF files "
+        "(`physics_raw_region.nc`, `bgc_raw_region.nc`, or any `.nc` / `.nc4` file). "
+        "Large files may take a moment to transfer through the browser."
+    )
+
+    cmems_files = st.file_uploader(
+        "Drop CMEMS NetCDF files here",
+        type=["nc", "nc4", "netcdf"],
+        accept_multiple_files=True,
+        key="cmems_uploader",
+        help="Physics and BGC NetCDF files from CMEMS downloads",
+        label_visibility="collapsed",
+    )
+
+    if cmems_files:
+        cmems_rows = []
+        total_cmems_bytes = 0
+        for f in cmems_files:
+            sz = len(f.getvalue())
+            total_cmems_bytes += sz
+            sz_str = f"{sz/1024:.1f} KB" if sz < 1024*1024 else f"{sz/1024/1024:.2f} MB"
+            # Light validation: try to open with xarray
+            valid = "❓"
+            dims_str = ""
+            try:
+                import xarray as xr, tempfile, shutil
+                tmp = tempfile.NamedTemporaryFile(suffix=".nc", delete=False)
+                tmp.write(f.getvalue())
+                tmp.close()
+                f.seek(0)
+                with xr.open_dataset(tmp.name) as ds_chk:
+                    dims_str = " × ".join(f"{k}:{v}" for k, v in ds_chk.dims.items())
+                    valid = "✅"
+                os.unlink(tmp.name)
+            except ImportError:
+                valid = "⚠️ xarray missing"
+            except Exception:
+                f.seek(0)
+                valid = "⚠️"
+            cmems_rows.append({"File": f.name, "Size": sz_str, "Dimensions": dims_str, "Valid": valid})
+
+        total_cmems_mb = total_cmems_bytes / 1024 / 1024
+        st.success(
+            f"**{len(cmems_files)} CMEMS file(s) staged** — "
+            f"Total: {total_cmems_mb:.2f} MB"
+        )
+        with st.expander(f"Preview {len(cmems_files)} staged CMEMS files", expanded=True):
+            st.dataframe(
+                pd.DataFrame(cmems_rows),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        if st.button("💾 Save CMEMS files to disk", key="save_cmems", type="primary"):
+            os.makedirs(cmems_dest, exist_ok=True)
+            prog = st.progress(0, text="Saving CMEMS files…")
+            saved_c, errors_c = [], []
+            for i, f in enumerate(cmems_files):
+                out_path = os.path.join(cmems_dest, f.name)
+                try:
+                    with open(out_path, "wb") as fh:
+                        fh.write(f.getvalue())
+                    saved_c.append(f.name)
+                except Exception as e:
+                    errors_c.append((f.name, str(e)))
+                prog.progress((i + 1) / len(cmems_files),
+                              text=f"Saving {f.name} ({i+1}/{len(cmems_files)})…")
+            prog.empty()
+            if saved_c:
+                st.success(
+                    f"✅ Saved **{len(saved_c)}** CMEMS file(s) to `{cmems_dest}`"
+                )
+            if errors_c:
+                for fname_e, err in errors_c:
+                    st.error(f"❌ {fname_e}: {err}")
+    else:
+        st.info(
+            "No CMEMS files staged yet. Click above to open the file picker "
+            "and select your `.nc` / `.nc4` files."
+        )
+
+    st.divider()
+
+    # ── folder scan (show what's already on disk) ──
+    st.markdown("#### Current raw data on disk")
+    st.caption("Files already present in the AIS and CMEMS destination folders.")
+
+    scan_col1, scan_col2 = st.columns(2)
+
+    def scan_folder(folder, exts):
+        """Return a DataFrame of files in folder matching extensions."""
+        rows = []
+        if not os.path.isdir(folder):
+            return None
+        for fname in sorted(os.listdir(folder)):
+            if any(fname.lower().endswith(e) for e in exts):
+                fpath = os.path.join(folder, fname)
+                try:
+                    sz = os.path.getsize(fpath)
+                    sz_str = (f"{sz/1024/1024:.2f} MB" if sz >= 1024*1024
+                              else f"{sz/1024:.1f} KB")
+                except Exception:
+                    sz_str = "?"
+                rows.append({"File": fname, "Size": sz_str})
+        return pd.DataFrame(rows) if rows else None
+
+    with scan_col1:
+        st.markdown(f"**AIS raw folder** — `{ais_dest}`")
+        ais_scan = scan_folder(ais_dest, [".csv"])
+        if ais_scan is not None:
+            st.caption(f"{len(ais_scan)} CSV file(s) found")
+            st.dataframe(ais_scan, use_container_width=True, hide_index=True)
+        elif os.path.isdir(ais_dest):
+            st.info("Folder exists but contains no CSV files yet.")
+        else:
+            st.info("Folder does not exist yet — it will be created on first save.")
+
+    with scan_col2:
+        st.markdown(f"**CMEMS raw folder** — `{cmems_dest}`")
+        cmems_scan = scan_folder(cmems_dest, [".nc", ".nc4", ".netcdf"])
+        if cmems_scan is not None:
+            st.caption(f"{len(cmems_scan)} NetCDF file(s) found")
+            st.dataframe(cmems_scan, use_container_width=True, hide_index=True)
+        elif os.path.isdir(cmems_dest):
+            st.info("Folder exists but contains no NetCDF files yet.")
+        else:
+            st.info("Folder does not exist yet — it will be created on first save.")
+
+
+# ═════════════════════════════════════════════════════════════════════════════
+# TAB 6 — ABOUT
 # ═════════════════════════════════════════════════════════════════════════════
 with tab_about:
     st.markdown("### About this system")
@@ -1019,10 +1270,10 @@ with tab_about:
         ("03 Model training",
          "Stack 7 channels (SST,SSH,VO,UO,Chl,NPPV,fishing_effort) · "
          "create seq=3 → pred=1 sequences · 70/15/15 split · "
-         "2-layer ConvLSTM2D (64→32) + Conv2D sigmoid · binary_crossentropy"),
+         "2-layer ConvLSTM (16→8) + 1×1 matmul sigmoid · focal loss · pure NumPy"),
         ("04 Evaluation",
-         "Load `convlstm_model.h5` · predict on X_test (NaN→0) · "
-         "compute RMSE, MAE, F1@0.5, SSI, Wasserstein · save CSV"),
+         "Load `convlstm_weights.npz` · reconstruct NumPy model · predict on X_test (NaN→0) · "
+         "compute RMSE, MAE, F1 threshold sweep, SSI, Wasserstein · save CSV"),
         ("05 Visualization",
          "Load predictions.npy + y_test.npy · obs-vs-pred grid · "
          "error maps (RdBu_r / Reds) · RMSE over time · training curves"),
@@ -1038,38 +1289,37 @@ with tab_about:
 
     with a_col:
         st.markdown("#### Model architecture")
-        st.code("""# 03_model_training.ipynb
-Input  (batch, SEQ_LEN=3, 41, 25, 7)
-  ConvLSTM2D  filters=64  kernel=3×3  padding='same'
-              return_sequences=True
-  BatchNormalization
+        st.code("""# 03_buildntrain_numpy.ipynb  (pure NumPy — no torch/tf)
+Input  (batch, SEQ_LEN=3, 41, 25, 7)  channel-last
+  ConvLSTMLayer(7  → 16, return_sequences=True)   im2col + matmul
+  BatchNorm(16)
   Dropout(0.2)
-  ConvLSTM2D  filters=32  kernel=3×3  padding='same'
-              return_sequences=False
-  BatchNormalization
+  ConvLSTMLayer(16 → 8,  return_sequences=False)
+  BatchNorm(8)
   Dropout(0.2)
-  Conv2D      filters=1   kernel=1×1  activation='sigmoid'
+  1×1 matmul (8 → 1) + bias
+  sigmoid
 Output (batch, 41, 25, 1)   ∈ [0, 1]
 
-optimizer='adam'
-loss='binary_crossentropy'
-metrics=['mae']
-epochs=50  batch_size=8  patience=10""", language="text")
+optimizer=ManualAdam(lr=1e-3)
+loss=focal_loss(alpha=1-pos_ratio, gamma=2.0)
+grad_clip=1.0
+epochs=50  batch_size=8  patience=10
+weights saved as: convlstm_weights.npz""", language="text")
 
     with o_col:
         st.markdown("#### Output file status")
         st.caption("See the **Pipeline** tab for a detailed per-phase checklist with file sizes.")
         outputs = {
-            "data_summary.json":            "Phase 3 — dataset metadata",
+            "data_summary.json":            "Phase 1 — dataset metadata",
             "preprocessed_features.nc":     "Phase 2 — 7-channel normalised cube",
             "ais_fishing_effort_gridded.nc": "Phase 2 — AIS on 0.25° grid",
-            "best_model.keras":             "Phase 3 — best val checkpoint (native Keras)",
-            "convlstm_model.keras":         "Phase 3 — final model (native Keras)",
+            "convlstm_weights.npz":         "Phase 3 — NumPy ConvLSTM weights (best val checkpoint)",
             "training_history.json":        "Phase 3 — loss & MAE per epoch",
             "X_test.npy":                   "Phase 3 — test inputs (N,3,41,25,7)",
             "y_test.npy":                   "Phase 3 — test labels (N,41,25,1)",
             "predictions.npy":              "Phase 4 — model predictions (N,41,25,1)",
-            "evaluation_results.csv":       "Phase 4 — RMSE,MAE,F1,SSI,Wasserstein",
+            "evaluation_results.csv":       "Phase 4 — RMSE,MAE,F1_best,F1_config,SSI,Wasserstein",
         }
         rows = []
         for fname, desc in outputs.items():
